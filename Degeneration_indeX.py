@@ -71,7 +71,7 @@ if start_response == "y":
 
         print("We got two words for ya...")
         time.sleep(3)
-        print("Stock it!")
+        print("Stock Market!")
 
 else:
     print("Operation canceled.")
