@@ -1,202 +1,120 @@
-import json
-import time
-import datetime
-import argparse
-import requests
-from symbols import symbols
-import schedule
-import threading
-import holidays
+d_index
+#!pip install hmmlearn
+#!pip install matplotlib
+#!pip install yfinance
+import yfinance as yf
+import pandas as pd
+import numpy as np
+empty_series = pd.Series(dtype='float64')
+pd.Series(dtype='float64')
+#from pyhhmm.gaussian import GaussianHMM
+from hmmlearn.hmm import GaussianHMM
+from pandas_datareader.data import DataReader
+import matplotlib.pyplot as plt
+
+#Data Extraction
+start_date = '2017-01-01'
+end_date = '2022-06-01'
+symbol = 'SPY'
+data = yf.download(symbol, auto_adjust=False, start=start_date, end=end_date)
+data = data[["Open", "High", "Low", "Adj Close"]]
 
 
-def save_daily_price(symbol, data):
-    today = datetime.datetime.now().strftime("%Y-%m-%d")
-    path = f"data/{symbol}"
-    os.makedirs(path, exist_ok=True)
-    file_path = f"{path}/{today}.json"
-    with open(file_path, "w") as f:
-        json.dump(data, f, indent=2)
-    print(f"[SAVED] {symbol} -> {file_path}")
+# Add Moving Average
+df["MA_12"] = df["Adj Close"].rolling(window=12).mean()
+df["MA_21"] = df["Adj Close"].rolling(window=21).mean()
+#df.head(2)
 
-def fetch_all_symbols():
-    print("\nFetching daily prices from Finnhub...\n")
-    for sector, symbol_list in symbols.items():
-        for sym in symbol_list:
-            try:
-                data = fetch_daily_price(sym)
-                save_daily_price(sym, data)
-                time.sleep(RATE_LIMIT_SLEEP)
-            except Exception as e:
-                print(f"[ERROR] {sym}: {e}")
+# Structure Data
+X_train = df[["Returns", "Range"]].iloc[:500] # First 500
+X_test = df[["Returns", "Range"]].iloc[500:] #tested against everything after first 500
+save_df = df.iloc[500:]
 
-def load_price_history(symbol, min_days=200):
-    hist_path = f"data/{symbol}/history.json"
-    if os.path.exists(hist_path):
-        with open(hist_path) as f:
-            records = json.load(f)
-    else:
-        records = []
+print("Train Length: ", len(X_train))
+print("Test Length: ", len(X_test))
+print("X_train From: ", X_train.head(1).index.item())
+print("X_train To: ", X_train.tail(1).index.item())
+print("X_test From: ", X_test.head(1).index.item())
+print("X_test To: ", X_test.tail(1).index.item())
 
-    if len(records) < min_days:
-        records = fetch_historical_prices(symbol, days=min_days)
+# Train HMM
+model = GaussianHMM(n_components=4, covariance_type='full', n_iter=2)
+model.fit(np.array(X_train.values))
+model.predict(X_train.values)[:10]
 
-        records.sort(key=lambda x: x[0]) #
-        return records
+# Make Prediction on Test Data
+df_main = save_df.copy()
+df_main.drop(columns=["High", "Low"], inplace=True)
 
-def moving_average(data, window):
-    if len(data) < window:
-        return None
-    return round(sum(data[-window:]) / window, 2)
+if isinstance(df_main.columns,
+pd.MultiIndex):
+    df_main.columns = df_main.columns.map(lambda x: x if isinstance(x,str) else x[0])
 
-def ytd_change(data):
-    if not data:
-        return None
+hmm_results = model.predict(X_test.values)
+df_main["HMM"] = hmm_results
+#df_main.tail()
 
-    year = datetime.date.today().year
-    jan_price = next(
-        (p for d, p in data if datetime.datetime.strptime(d, "%Y-%m-%d").year == year),
-        None
-    )
-    if jan_price is None:
-        return None
-    latest_price = data[-1][1]
-    return round(((latest_price - jan_price) / jan_price) * 100, 2)
+# Add MA Signals: 0=nothing, 1=long, -1=short
+df_main.loc[df_main["MA_12"] > df_main["MA_21"], "MA_Signal"] = 1 #If 12 day moving average is above 21 MA
+df_main.loc[df_main["MA_12"] <= df_main["MA_21"], "MA_Signal"] = 0
+#df_main[:30]
 
-def get_metrics(symbol):
-    try:
-        price_series = load_price_history(symbol.upper())
-        closes = [p for _, p in price_series]
-        return {
-            "YTD %": ytd_change(price_series), 
-            "12-day MA": moving_average(closes, 12),
-            "21-day MA": moving_average(closes, 21),
-            "50-day MA": moving_average(closes, 50),
-            "200-day MA": moving_average(closes, 200),
-            }
-    
-    except Exception as e:
-        return {"error": str(e)}
+# Add HMM Signals
+favourable_states = [1,3]
+hmm_values = df_main["HMM"].values
+hmm_values = [1 if x in favourable_states else 0 for x in hmm_values]
+df_main["HMM_Signal"] = hmm_values
+#df_main.iloc[50:]
 
-def display_metrics(symbol):
-    print(f"\nMetrics for {symbol.upper()}:\n")
-    data = get_metrics(symbol.upper())
-    for k, v in data.items():
-        print(f"{k}: {v}")
-    print()
+# Add Combined Signal
+df_main["Main_Signal"] = 0
+df_main.loc[(df_main["MA_Signal"] == 1) & (df_main["HMM_Signal"] == 1), "Main_Signal"] = 1
+df_main["Main_Signal"] = df_main["Main_Signal"].shift(1) #Prevent look-ahead bias
 
-# === Scheduler for Daily Fetch ===
+# Benchmark Returns
+df_main["lrets_bench"] = np.log(df_main["Adj Close"] / df_main["Adj Close"].shift(1))
+df_main["bench_prod"] = df_main["lrets_bench"].cumsum()
+df_main["bench_prod_exp"] = np.exp(df_main["bench_prod"]) - 1
 
-def is_market_day():
-    today = datetime.date.today()
-    return today.weekday() < 5 and today not in holidays.US()
+# Strategy Returns
 
-def scheduled_fetch():
-    if is_market_day():
-        print("\n[Scheduler] Running daily fetch...")
-        fetch_all_symbols()
-    else:
-        print("\n[Scheduler] Market is closed today. No fetch.")
+df_main["lrets_strat"] = (np.log(df_main["Open"].shift(-1) / df_main["Open"]).fillna(0)) * df_main["Main_Signal"]
+df_main["lrets_prod"] = df_main["lrets_strat"].cumsum()
+df_main["strat_prod_exp"] = np.exp(df_main["lrets_prod"]) - 1
 
-def run_scheduler():
-    schedule.every().day.at("16:30").do(scheduled_fetch)
-    print("\n[Scheduler] Auto-fetch scheduled for 4:30 PM each market day.")
-    
-    def loop():
-        while True:
-            schedule.run_pending()
-            time.sleep(30)
-    
-    thread = threading.Thread(target=loop)
-    thread.daemon = True
-    thread.start()
+# Review Results Table
+df_main.dropna(inplace=True)
+df_main.tail()
 
-# === Symbol Management ===
+# Sharpe Ratio Function
+def sharpe_ratio(returns_series):
+    N = 255
+    NSQRT = np.sqrt(N)
+    rf = 0.01
+    mean = returns_series.mean() * N
+    sigma = returns_series.std() * NSQRT
+    sharpe_ratio = round((mean - rf) / sigma, 2)
+    return sharpe_ratio
 
-def save_symbols():
-    with open("symbols_saved.json", "w") as f:
-        json.dump(symbols, f, indent=4)
-    print("Symbols saved to symbols_saved.json.")
+# Metrics
+bench_rets = round(df_main["bench_prod_exp"].values[-1] * 100, 1)
+strat_rets = round(df_main["strat_prod_exp"].values[-1] * 100, 1)
 
-def get_input(prompt, valid_responses):
-    while True:
-        response = input(prompt).strip().lower()
-        if response in valid_responses:
-            return response
-        else:
-            print(f"Please enter one of {valid_responses}.")
+bench_sharpe = sharpe_ratio(df_main["lrets_bench"].values)
+strat_sharpe = sharpe_ratio(df_main["lrets_strat"].values)
 
-def get_sector():
-    print("Select the sector for the symbol:")
-    sectors = list(symbols.keys())
-    for i, sector in enumerate(sectors, 1):
-        print(f"{i}. {sector}")
-    while True:
-        try:
-            choice = int(input("Enter number: "))
-            if 1 <= choice <= len(sectors):
-                return sectors[choice - 1]
-            print("Invalid number.")
-        except ValueError:
-            print("Please enter a valid number.")
+# Print Metrics
+print(f"Returns Benchmark: {bench_rets}%")
+print(f"Returns Strategy: {strat_rets}%")
+print("---- ---- ---- ---- ---- ----")
+print(f"Sharpe Benchmark: {bench_sharpe}")
+print(f"Sharpe Strategy: {strat_sharpe}")
 
-def modify_symbols(symbol, action):
-    if action == 'add':
-        if any(symbol in lst for lst in symbols.values()):
-            print(f"{symbol} already exists.")
-        else:
-            sector = get_sector()
-            symbols[sector].append(symbol)
-            print(f"Added {symbol} to {sector}.")
-    elif action == 'rm':
-        found = False
-        for sector, lst in symbols.items():
-            if symbol in lst:
-                lst.remove(symbol)
-                found = True
-                print(f"Removed {symbol} from {sector}.")
-                break
-        if not found:
-            print(f"{symbol} not found.")
-    save_symbols()
+# Plot Equity Curves
+fig = plt.figure(figsize = (18, 10))
+plt.plot(df_main["bench_prod_exp"])
+plt.plot(df_main["strat_prod_exp"])
+plt.show()
 
-def list_symbols():
-    print("\nTracked Symbols:\n")
-    for sector, symbol_list in symbols.items():
-        print(f"{sector}: {', '.join(symbol_list)}")
-    print()
-
-# === Main CLI ===
-
-def main():
-    parser = argparse.ArgumentParser(description="Stock tracker using Finnhub + local cache.")
-    parser.add_argument('--add', help='Add a stock symbol')
-    parser.add_argument('--rm', help='Remove a stock symbol')
-    parser.add_argument('--list', action='store_true', help='List tracked symbols')
-    parser.add_argument('--fetch', action='store_true', help='Fetch daily prices from Finnhub')
-    parser.add_argument('--auto', action='store_true', help='Run scheduler to auto-fetch at 4:30 PM daily')
-    parser.add_argument('--metrics', help='Display local metrics for symbol')
-
-    args = parser.parse_args()
-
-    if args.add:
-        modify_symbols(args.add.upper(), 'add')
-    elif args.rm:
-        modify_symbols(args.rm.upper(), 'rm')
-    elif args.list:
-        list_symbols()
-    elif args.fetch:
-        fetch_all_symbols()
-    elif args.metrics:
-        display_metrics(args.metrics)
-    elif args.auto:
-        run_scheduler()
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n[Scheduler] Stopped.")
-    else:
-        parser.print_help()
-
-if __name__ == "__main__":
-    main()
+# Save Data
+#df_main.to_csv("data/HMM-SPY.csv")
